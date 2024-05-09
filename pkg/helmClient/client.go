@@ -5,9 +5,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	error2 "github.com/devtron-labs/kubelink/error"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"helm.sh/helm/v3/pkg/action"
 	"helm.sh/helm/v3/pkg/chart"
 	"helm.sh/helm/v3/pkg/chart/loader"
+	"helm.sh/helm/v3/pkg/chartutil"
 	"helm.sh/helm/v3/pkg/cli"
 	"helm.sh/helm/v3/pkg/downloader"
 	"helm.sh/helm/v3/pkg/getter"
@@ -17,11 +21,15 @@ import (
 	"log"
 	"os"
 	"sigs.k8s.io/yaml"
+	"strconv"
+	"text/template"
+	"time"
 )
 
 var storage = repo.File{}
 
 const (
+	CHART_WORKING_DIR_PATH      = "/tmp/charts/"
 	defaultCachePath            = "/home/devtron/devtroncd/.helmcache"
 	defaultRepositoryConfigPath = "/home/devtron/devtroncd/.helmrepo"
 )
@@ -282,6 +290,13 @@ func (c *HelmClient) upgrade(ctx context.Context, helmChart *chart.Chart, update
 // Optionally lints the chart if the linting flag is set.
 func (c *HelmClient) upgradeWithChartInfo(ctx context.Context, spec *ChartSpec) (*release.Release, error) {
 	c.ActionConfig.RegistryClient = spec.RegistryClient
+	if len(spec.KubeVersion) > 0 {
+		c.ActionConfig.Capabilities = &chartutil.Capabilities{
+			KubeVersion: chartutil.KubeVersion{
+				Version: spec.KubeVersion,
+			},
+		}
+	}
 	client := action.NewUpgrade(c.ActionConfig)
 	copyUpgradeOptions(spec, client)
 
@@ -309,7 +324,6 @@ func (c *HelmClient) upgradeWithChartInfo(ctx context.Context, spec *ChartSpec) 
 	if err != nil {
 		return nil, err
 	}
-
 	return release, nil
 }
 
@@ -388,6 +402,10 @@ func getValuesMap(spec *ChartSpec) (map[string]interface{}, error) {
 
 	err := yaml.Unmarshal([]byte(spec.ValuesYaml), &values)
 	if err != nil {
+		if error2.IsValidationError(err) {
+			err = status.New(codes.InvalidArgument, err.Error()).Err()
+			return nil, err
+		}
 		return nil, err
 	}
 
@@ -415,6 +433,13 @@ func (c *HelmClient) chartIsInstalled(releaseName string, releaseNamespace strin
 // install installs the provided chart.
 // Optionally lints the chart if the linting flag is set.
 func (c *HelmClient) install(ctx context.Context, spec *ChartSpec) (*release.Release, error) {
+	if len(spec.KubeVersion) > 0 {
+		c.ActionConfig.Capabilities = &chartutil.Capabilities{
+			KubeVersion: chartutil.KubeVersion{
+				Version: spec.KubeVersion,
+			},
+		}
+	}
 	client := action.NewInstall(c.ActionConfig)
 	copyInstallOptions(spec, client)
 
@@ -554,6 +579,12 @@ func (c *HelmClient) GetNotes(spec *ChartSpec, options *HelmTemplateOptions) ([]
 	out := new(bytes.Buffer)
 	rel, err := client.Run(helmChart, values)
 	if err != nil {
+		if _, isExecError := err.(template.ExecError); isExecError {
+			return nil, status.Errorf(
+				codes.FailedPrecondition,
+				fmt.Sprintf("invalid template, err %s", err),
+			)
+		}
 		fmt.Errorf("error in fetching release for helm chart %q and repo Url %q",
 			spec.ChartName,
 			spec.RepoURL,
@@ -566,14 +597,15 @@ func (c *HelmClient) GetNotes(spec *ChartSpec, options *HelmTemplateOptions) ([]
 
 }
 
-func (c *HelmClient) TemplateChart(spec *ChartSpec, options *HelmTemplateOptions, chartData []byte) ([]byte, error) {
+func (c *HelmClient) TemplateChart(spec *ChartSpec, options *HelmTemplateOptions, chartData []byte, returnChartBytes bool) ([]byte, []byte, error) {
 	var helmChart *chart.Chart
 	var chartPath string
+	var chartBytes []byte
 	var err error
 	if chartData != nil {
 		helmChart, err = loader.LoadArchive(bytes.NewReader(chartData))
 		if err != nil {
-			return nil, err
+			return nil, chartBytes, err
 		}
 	}
 	c.ActionConfig.RegistryClient = spec.RegistryClient
@@ -595,7 +627,7 @@ func (c *HelmClient) TemplateChart(spec *ChartSpec, options *HelmTemplateOptions
 	// the ReleaseName if set or the generatedName as the first return value.
 	releaseName, _, err := client.NameAndChart([]string{spec.ChartName})
 	if err != nil {
-		return nil, err
+		return nil, chartBytes, err
 	}
 	client.ReleaseName = releaseName
 
@@ -607,23 +639,36 @@ func (c *HelmClient) TemplateChart(spec *ChartSpec, options *HelmTemplateOptions
 	if chartData == nil {
 		helmChart, err = c.getChartFromHelm(spec, client, helmChart, chartPath, err)
 		if err != nil {
-			return nil, err
+			return nil, chartBytes, err
+		}
+
+		if returnChartBytes {
+			chartBytes, err = GetChartBytes(helmChart)
+			if err != nil {
+				return nil, nil, err
+			}
 		}
 	}
 
 	values, err := getValuesMap(spec)
 	if err != nil {
-		return nil, err
+		return nil, chartBytes, err
 	}
 
 	out := new(bytes.Buffer)
 	rel, err := client.Run(helmChart, values)
 	if err != nil {
+		if _, isExecError := err.(template.ExecError); isExecError {
+			return nil, chartBytes, status.Errorf(
+				codes.FailedPrecondition,
+				fmt.Sprintf("invalid template, err %s", err),
+			)
+		}
 		fmt.Errorf("error in fetching release for helm chart %q and repo Url %q",
 			spec.ChartName,
 			spec.RepoURL,
 		)
-		return nil, err
+		return nil, chartBytes, err
 	}
 
 	// We ignore a potential error here because, when the --debug flag was specified,
@@ -643,7 +688,7 @@ func (c *HelmClient) TemplateChart(spec *ChartSpec, options *HelmTemplateOptions
 	//}
 	fmt.Fprintf(out, "%s", rel.Manifest)
 
-	return out.Bytes(), err
+	return out.Bytes(), chartBytes, err
 }
 
 func (c *HelmClient) getChartFromHelm(spec *ChartSpec, client *action.Install, helmChart *chart.Chart, chartPath string, err error) (*chart.Chart, error) {
@@ -725,4 +770,32 @@ func updateDependencies(helmChart *chart.Chart, chartPathOptions *action.ChartPa
 		}
 	}
 	return helmChart, nil
+}
+
+func GetChartBytes(helmChart *chart.Chart) ([]byte, error) {
+	dirPath := CHART_WORKING_DIR_PATH
+	outputChartPathDir := fmt.Sprintf("%s/%s", dirPath, strconv.FormatInt(time.Now().UnixNano(), 16))
+	err := os.MkdirAll(outputChartPathDir, os.ModePerm)
+	if err != nil {
+		return nil, err
+	}
+
+	defer func() {
+		err := os.RemoveAll(outputChartPathDir)
+		if err != nil {
+			fmt.Println("error in deleting dir", " dir: ", outputChartPathDir, " err: ", err)
+		}
+	}()
+	absFilePath, err := chartutil.Save(helmChart, outputChartPathDir)
+	if err != nil {
+		fmt.Println("error in saving chartdata in the destination dir ", " dir : ", outputChartPathDir, " err : ", err)
+		return nil, err
+	}
+
+	chartBytes, err := os.ReadFile(absFilePath)
+	if err != nil {
+		fmt.Println("error in reading chartdata from the file ", " filePath : ", absFilePath, " err : ", err)
+	}
+
+	return chartBytes, nil
 }
